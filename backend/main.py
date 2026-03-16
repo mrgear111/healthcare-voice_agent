@@ -21,18 +21,51 @@ appointment_service = AppointmentService()
 llm_service = LLMService()
 tts_handler = DeepgramTTSHandler()
 memory_manager = MemoryManager()
+active_sessions = {} # Track {session_id: task} for interruption
 
-async def stream_to_tts(text_generator, websocket, language="en"):
+async def interrupt_session(session_id, websocket):
+    interrupted = False
+    if session_id in active_sessions:
+        task = active_sessions[session_id]
+        if not task.done():
+            logger.info(f"🚫 Interrupting session {session_id}")
+            task.cancel()
+            interrupted = True
+            try:
+                await task
+            except asyncio.CancelledError:
+                pass
+        active_sessions.pop(session_id, None)
+    
+    # Only clear audio if we actually stopped an ongoing process
+    if interrupted and websocket:
+        await websocket.send_json({"type": "clear_audio"})
+
+async def stream_to_tts(text_generator, websocket, language="en", on_audio_start=None):
     """ Helper to pipe text stream to tts and then to websocket """
-    await tts_handler.stream_audio(text_generator, websocket, language=language)
+    await tts_handler.stream_audio(text_generator, websocket, language=language, on_audio_start=on_audio_start)
 
-async def llm_callback(text, is_final=False, websocket=None, session_id="default", language="en"):
-    logger.debug(f"llm_callback trace: text='{text}', is_final={is_final}")
-    if not is_final:
+async def llm_callback(text, is_final=False, websocket=None, session_id="default", language="en", confidence=0.0, start_time=None):
+    logger.debug(f"llm_callback trace: text='{text}', is_final={is_final}, conf={confidence}")
+    if not is_final and text is not None:
         return
 
     logger.info(f"Executing LLM for: {text} (Session: {session_id}, Language: {language})")
     try:
+        # Start timing for metrics
+        import time
+        t0 = start_time or time.time()
+        
+        async def on_audio_start():
+            latency = int((time.time() - t0) * 1000)
+            logger.info(f"📊 Latency Metric: {latency}ms")
+            if websocket:
+                await websocket.send_json({
+                    "type": "metrics",
+                    "latency": latency,
+                    "confidence": confidence
+                })
+
         # 1. Fetch persistent history (Requirement: Awareness of patient context)
         conversation_history = memory_manager.get_session(session_id)
         if not conversation_history:
@@ -54,9 +87,10 @@ async def llm_callback(text, is_final=False, websocket=None, session_id="default
                 yield val
 
         # Start TTS streaming in background (Requirement: Standard Indian language support)
-        tts_task = asyncio.create_task(stream_to_tts(text_iterator(), websocket, language=language))
+        tts_task = asyncio.create_task(stream_to_tts(text_iterator(), websocket, language=language, on_audio_start=on_audio_start))
 
         full_response = ""
+        buffer = ""
         tool_use = None
         tool_input_json = ""
         
@@ -65,7 +99,13 @@ async def llm_callback(text, is_final=False, websocket=None, session_id="default
                 if event.delta.type == "text_delta":
                     content = event.delta.text
                     full_response += content
-                    await text_queue.put(content)
+                    buffer += content
+                    
+                    # Split by common sentence endings to reduce TTS jitter
+                    if any(p in content for p in [".", "?", "!", "\n"]):
+                        await text_queue.put(buffer)
+                        buffer = ""
+                        
                     if websocket:
                         await websocket.send_json({"type": "llm_text", "content": content})
                 elif event.delta.type == "input_json_delta":
@@ -78,6 +118,8 @@ async def llm_callback(text, is_final=False, websocket=None, session_id="default
                         await websocket.send_json({"type": "reasoning", "content": f"Thinking: Calling tool {tool_use.name}..."})
 
         # Signal end of text to TTS
+        if buffer:
+            await text_queue.put(buffer)
         await text_queue.put(None)
         await tts_task
 
@@ -115,7 +157,7 @@ async def llm_callback(text, is_final=False, websocket=None, session_id="default
             })
             
             # Recursive call for final response
-            await llm_callback(None, True, websocket, session_id, language)
+            await llm_callback(None, True, websocket, session_id, language, confidence=confidence, start_time=t0)
         
         elif full_response:
             conversation_history.append({"role": "assistant", "content": full_response})
@@ -123,6 +165,9 @@ async def llm_callback(text, is_final=False, websocket=None, session_id="default
             logger.info(f"Agent: {full_response}")
         
         memory_manager.save_session(session_id, conversation_history)
+    except asyncio.CancelledError:
+        logger.info(f"Task for {session_id} was cancelled (interrupted).")
+        raise
     except Exception as e:
         logger.error(f"CRITICAL ERROR in llm_callback: {e}", exc_info=True)
         if websocket:
@@ -134,7 +179,11 @@ async def voice_websocket(websocket: WebSocket, session_id: str = "default", lan
     logger.info(f"Client connected: session={session_id}, lang={language}, rate={sample_rate}")
     
     # 5. Turn Management & Speech Detection (Requirement: Turn Management & VAD)
-    async def wrapped_callback(text, is_final=False):
+    async def wrapped_callback(text, is_final=False, confidence=0.0):
+        # Record start time for latency measurement
+        import time
+        start_time = time.time() if is_final else None
+
         # Immediate UI feedback for transcription
         await websocket.send_json({
             "type": "stt_text", 
@@ -143,9 +192,10 @@ async def voice_websocket(websocket: WebSocket, session_id: str = "default", lan
         })
         # Proceed to LLM only when final
         if is_final:
-            logger.info(f"STT Final -> Triggering LLM: {text}")
+            logger.info(f"STT Final -> Triggering LLM: {text} (conf={confidence:.2f})")
             # Run LLM in background so we don't block the STT/Audio loop
-            asyncio.create_task(llm_callback(text, is_final, websocket, session_id, language))
+            task = asyncio.create_task(llm_callback(text, is_final, websocket, session_id, language, confidence, start_time))
+            active_sessions[session_id] = task
 
     stt_handler = DeepgramHandler(callback=wrapped_callback)
     await stt_handler.start(language=language + "-IN" if language != "en" else "en-US", sample_rate=sample_rate)

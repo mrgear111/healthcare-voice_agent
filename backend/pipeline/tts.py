@@ -15,7 +15,7 @@ class DeepgramTTSHandler:
         self._ctx = None
         self.dg_connection = None
 
-    async def stream_audio(self, text_iterator, websocket, language="en"):
+    async def stream_audio(self, text_iterator, websocket, language="en", on_audio_start=None):
         """
         Streams audio chunks from Deepgram Aura to the client WebSocket.
         """
@@ -28,9 +28,15 @@ class DeepgramTTSHandler:
             )
             self.dg_connection = await self._ctx.__aenter__()
             
+            self._audio_started = False
+
             # Start background listener for the audio chunks
             async def on_message(message, **kwargs):
                 if isinstance(message, bytes):
+                    if not self._audio_started:
+                        self._audio_started = True
+                        if on_audio_start:
+                            await on_audio_start()
                     if websocket:
                         await websocket.send_bytes(message)
                 # Metadata can be ignored for basic streaming

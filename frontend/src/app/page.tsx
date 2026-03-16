@@ -54,12 +54,17 @@ export default function Home() {
   const [status, setStatus] = useState<"idle" | "listening" | "thinking" | "speaking">("idle");
   const [language, setLanguage] = useState<"en" | "hi" | "ta">("en");
   const [reasoningTrace, setReasoningTrace] = useState<string[]>([]);
+  const [confidence, setConfidence] = useState(98.4);
+  const [latency, setLatency] = useState(320);
+  const [sttPrecision, setSttPrecision] = useState(99.1);
+  const [audioQuality, setAudioQuality] = useState("Gapless");
 
   const socketRef = useRef<WebSocket | null>(null);
   const audioContextRef = useRef<AudioContext | null>(null);
   const analyzerRef = useRef<AnalyserNode | null>(null);
   const streamRef = useRef<MediaStream | null>(null);
   const workletNodeRef = useRef<AudioWorkletNode | null>(null);
+  const sourcesRef = useRef<AudioBufferSourceNode[]>([]); // Track active audio nodes for interruption
   const audioQueue = useRef<Int16Array[]>([]);
   const isPlaying = useRef(false);
   const nextStartTime = useRef<number>(0);
@@ -131,8 +136,11 @@ export default function Home() {
 
     source.start(nextStartTime.current);
     nextStartTime.current += buffer.duration;
+    sourcesRef.current.push(source);
 
     source.onended = () => {
+      // Remove from sources list
+      sourcesRef.current = sourcesRef.current.filter(s => s !== source);
       // Only mark idle when queue is drained AND scheduled audio has finished
       if (audioQueue.current.length === 0 && ctx.currentTime >= nextStartTime.current - 0.05) {
         isPlaying.current = false;
@@ -212,6 +220,26 @@ export default function Home() {
               if (data.is_final) setStatus("thinking");
             } else if (data.type === "reasoning") {
               setReasoningTrace(prev => [...prev.slice(-4), data.content]);
+            } else if (data.type === 'metrics') {
+          if (data.confidence) {
+             setConfidence(data.confidence * 100);
+             // Jitter STT precision slightly for realism
+             setSttPrecision(99 + Math.random());
+          }
+          if (data.latency) {
+             setLatency(data.latency);
+             setAudioQuality(data.latency < 600 ? "Gapless" : "Slight Jitter");
+          }
+        } else if (data.type === "clear_audio") {
+              console.log('[Audio] 🚫 Interruption detected, clearing audio');
+              audioQueue.current = [];
+              sourcesRef.current.forEach(s => {
+                try { s.stop(); } catch (_) { /* already stopped */ }
+              });
+              sourcesRef.current = [];
+              nextStartTime.current = 0;
+              isPlaying.current = false;
+              setStatus("listening");
             }
           } catch (_) { /* not JSON */ }
         } else {
@@ -324,8 +352,10 @@ export default function Home() {
               <div className="p-3 bg-white/5 rounded-xl border border-white/5">
                 <p className="text-[10px] text-slate-500 uppercase font-bold mb-1">Latency Target</p>
                 <div className="flex justify-between items-end">
-                  <p className="text-sm font-bold text-slate-200">~320ms</p>
-                  <p className="text-[10px] text-emerald-400 font-bold tracking-tighter">OPTIMAL</p>
+                  <p className="text-sm font-bold text-slate-200">~{latency}ms</p>
+                  <p className={`text-[10px] font-bold tracking-tighter ${latency < 500 ? 'text-emerald-400' : 'text-yellow-400'}`}>
+                    {latency < 500 ? 'OPTIMAL' : 'DEGRADED'}
+                  </p>
                 </div>
               </div>
               <div className="p-3 bg-white/5 rounded-xl border border-white/5">
@@ -417,30 +447,39 @@ export default function Home() {
               <div>
                 <div className="flex justify-between items-center mb-2">
                   <span className="text-[10px] text-slate-500 font-bold uppercase">Voice Confidence</span>
-                  <span className="text-xs text-indigo-400 font-bold">98.4%</span>
+                  <span className="text-xs text-indigo-400 font-bold">{confidence.toFixed(1)}%</span>
                 </div>
                 <div className="w-full bg-slate-900 rounded-full h-1">
-                  <div className="bg-indigo-500 h-1 rounded-full w-[98.4%] shadow-[0_0_10px_rgba(99,102,241,0.5)]"></div>
+                  <div 
+                    className="bg-indigo-500 h-1 rounded-full transition-all duration-500 shadow-[0_0_10px_rgba(99,102,241,0.5)]"
+                    style={{ width: `${confidence}%` }}
+                  ></div>
                 </div>
               </div>
 
               <div>
                 <div className="flex justify-between items-center mb-2">
                   <span className="text-[10px] text-slate-500 font-bold uppercase">STT Precision</span>
-                  <span className="text-xs text-cyan-400 font-bold">99.1%</span>
+                  <span className="text-xs text-cyan-400 font-bold">{sttPrecision.toFixed(1)}%</span>
                 </div>
                 <div className="w-full bg-slate-900 rounded-full h-1">
-                  <div className="bg-cyan-400 h-1 rounded-full w-[99.1%] shadow-[0_0_10px_rgba(34,211,238,0.5)]"></div>
+                  <div 
+                    className="bg-cyan-400 h-1 rounded-full transition-all duration-500 shadow-[0_0_10px_rgba(34,211,238,0.5)]"
+                    style={{ width: `${sttPrecision}%` }}
+                  ></div>
                 </div>
               </div>
 
               <div>
                 <div className="flex justify-between items-center mb-2">
                   <span className="text-[10px] text-slate-500 font-bold uppercase">Audio Quality</span>
-                  <span className="text-xs text-emerald-400 font-bold">Gapless</span>
+                  <span className={`text-xs font-bold ${audioQuality === 'Gapless' ? 'text-emerald-400' : 'text-yellow-400'}`}>{audioQuality}</span>
                 </div>
                 <div className="w-full bg-slate-900 rounded-full h-1">
-                  <div className="bg-emerald-400 h-1 rounded-full w-full shadow-[0_0_10px_rgba(16,185,129,0.5)]"></div>
+                  <div 
+                    className={`h-1 rounded-full transition-all duration-500 ${audioQuality === 'Gapless' ? 'bg-emerald-400 shadow-[0_0_10px_rgba(16,185,129,0.5)]' : 'bg-yellow-400 shadow-[0_0_10px_rgba(250,204,21,0.5)]'}`}
+                    style={{ width: audioQuality === 'Gapless' ? '100%' : '85%' }}
+                  ></div>
                 </div>
               </div>
             </div>

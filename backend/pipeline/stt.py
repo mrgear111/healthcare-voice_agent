@@ -58,19 +58,38 @@ class DeepgramHandler:
                     msg_type = data.get("type", "")
 
                     if msg_type == "Results":
-                        channel = data.get("channel", {})
-                        alternatives = channel.get("alternatives", [])
+                        logger.debug(f"DG Results Keys: {list(data.keys())}")
+                        
+                        # Aggressive search for alternatives
+                        alternatives = None
+                        if "channel" in data:
+                            alternatives = data["channel"].get("alternatives")
+                        elif "results" in data:
+                            channels = data["results"].get("channels", [])
+                            if channels:
+                                alternatives = channels[0].get("alternatives")
+                        
+                        if not alternatives and "alternatives" in data:
+                            alternatives = data["alternatives"]
+                            
                         if alternatives:
-                            transcript = alternatives[0].get("transcript", "")
+                            alt = alternatives[0]
+                            transcript = alt.get("transcript", "")
+                            confidence = alt.get("confidence", 0.0)
                             is_final = data.get("is_final", False)
                             speech_final = data.get("speech_final", False)
                             if transcript:
-                                logger.info(f"✅ DG STT: '{transcript}' (final={is_final}, speech_final={speech_final})")
-                                await self.callback(transcript, speech_final or is_final)
+                                logger.info(f"✅ DG STT: '{transcript}' (final={is_final}, speech_final={speech_final}, conf={confidence:.2f})")
+                                await self.callback(transcript, speech_final or is_final, confidence)
+                            else:
+                                pass # empty transcript is common in interim results
+                        else:
+                            logger.debug(f"Could not find alternatives in DG Result. Keys: {list(data.keys())}")
                     elif msg_type == "Metadata":
                         logger.debug(f"DG Metadata received")
                     elif msg_type == "SpeechStarted":
                         logger.debug("DG: Speech started")
+                        await self.callback("", False, speech_started=True)
                     else:
                         logger.debug(f"DG msg: {msg_type}")
                 except json.JSONDecodeError:
