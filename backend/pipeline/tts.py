@@ -1,81 +1,106 @@
 import os
 import asyncio
 import logging
-from deepgram import AsyncDeepgramClient
-from deepgram.core.events import EventType
-from deepgram.speak.v1.types.speak_v1text import SpeakV1Text
+import base64
+
+try:
+    from sarvamai import AsyncSarvamAI, AudioOutput, EventResponse, ErrorResponse
+except ImportError:  # pragma: no cover - handled at runtime
+    AsyncSarvamAI = None
+    AudioOutput = object
+    EventResponse = object
+    ErrorResponse = object
 
 logger = logging.getLogger(__name__)
 
-class DeepgramTTSHandler:
+class SarvamTTSHandler:
     def __init__(self):
-        self.api_key = os.getenv("DEEPGRAM_API_KEY")
-        self.client = AsyncDeepgramClient(api_key=self.api_key)
-        self.model = "aura-asteria-en" # Default clear female voice
-        self._ctx = None
-        self.dg_connection = None
+        self.api_key = os.getenv("SARVAM_API_KEY")
+        self.client = AsyncSarvamAI(api_subscription_key=self.api_key) if (AsyncSarvamAI and self.api_key) else None
+        self.model = "bulbul:v3"
+        self.target_language_code = "en-IN"
+        self.speaker = "shubh"
 
-    async def stream_audio(self, text_iterator, websocket, language="en", on_audio_start=None):
+    async def stream_audio(
+        self,
+        text_iterator,
+        websocket,
+        language="en",
+        on_audio_start=None,
+        on_audio_end=None,
+    ):
         """
-        Streams audio chunks from Deepgram Aura to the client WebSocket.
+        Streams PCM audio chunks from Sarvam TTS to the client WebSocket.
         """
+        if AsyncSarvamAI is None:
+            logger.error("sarvamai package is not installed. Install with: pip install sarvamai")
+            return
+        if not self.api_key:
+            logger.error("Missing SARVAM_API_KEY in environment")
+            return
+
         try:
             self.set_language(language)
-            self._ctx = self.client.speak.v1.connect(
+            async with self.client.text_to_speech_streaming.connect(
                 model=self.model,
-                encoding="linear16",
-                sample_rate="16000",
-            )
-            self.dg_connection = await self._ctx.__aenter__()
-            
-            self._audio_started = False
+                send_completion_event=True,
+            ) as ws:
+                await ws.configure(
+                    target_language_code=self.target_language_code,
+                    speaker=self.speaker,
+                    output_audio_codec="wav",
+                    speech_sample_rate=16000,
+                )
 
-            # Start background listener for the audio chunks
-            async def on_message(message, **kwargs):
-                if isinstance(message, bytes):
-                    if not self._audio_started:
-                        self._audio_started = True
-                        if on_audio_start:
-                            await on_audio_start()
-                    if websocket:
-                        await websocket.send_bytes(message)
-                # Metadata can be ignored for basic streaming
+                audio_started = False
 
-            async def on_error(error, **kwargs):
-                logger.error(f"Deepgram TTS Error: {error}")
+                async def send_text() -> None:
+                    async for text in text_iterator:
+                        if text:
+                            await ws.convert(text)
+                    await ws.flush()
 
-            self.dg_connection.on(EventType.MESSAGE, on_message)
-            self.dg_connection.on(EventType.ERROR, on_error)
-            
-            # Start listening task
-            asyncio.create_task(self.dg_connection.start_listening())
+                sender_task = asyncio.create_task(send_text())
 
-            # Send text chunks from the iterator
-            async for text in text_iterator:
-                if text:
-                    await self.dg_connection.send_text(SpeakV1Text(text=text))
-            
-            # Deepgram TTS needs a Flush or Close to finish streaming
-            await self.dg_connection.send_flush()
-            
-            # Wait a bit for remaining audio
-            await asyncio.sleep(0.5)
+                async for message in ws:
+                    if isinstance(message, AudioOutput):
+                        audio_b64 = getattr(message.data, "audio", "")
+                        if not audio_b64:
+                            continue
+
+                        if not audio_started:
+                            audio_started = True
+                            if on_audio_start:
+                                await on_audio_start()
+
+                        if websocket:
+                            await websocket.send_bytes(base64.b64decode(audio_b64))
+                    elif isinstance(message, EventResponse):
+                        event_type = getattr(message.data, "event_type", "")
+                        if event_type == "final":
+                            break
+                    elif isinstance(message, ErrorResponse):
+                        logger.error("Sarvam TTS stream error: %s", message.data)
+                        break
+
+                await sender_task
             
         except Exception as e:
-            logger.error(f"Deepgram TTS streaming error: {e}")
+            logger.error(f"Sarvam TTS streaming error: {e}", exc_info=True)
         finally:
-            if self._ctx:
-                await self._ctx.__aexit__(None, None, None)
-                self.dg_connection = None
-                self._ctx = None
+            if on_audio_end:
+                try:
+                    await on_audio_end()
+                except Exception:
+                    pass
 
     def set_language(self, language_code):
-        # Deepgram Aura models are language-specific
-        if language_code == "en":
-            self.model = "aura-asteria-en"
-        elif language_code == "hi":
-            # Check availability or fallback
-            pass
-        elif language_code == "ta":
-            # Check availability or fallback
-            pass
+        language_map = {
+            "en": "en-IN",
+            "hi": "hi-IN",
+            "ta": "ta-IN",
+        }
+        self.target_language_code = language_map.get(language_code, "en-IN")
+
+        # Keep a documented speaker value to avoid invalid-speaker failures.
+        self.speaker = "shubh"

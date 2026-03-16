@@ -4,9 +4,9 @@
 A real-time voice AI agent for clinical appointment booking. The agent operates in English, Hindi, and Tamil, maintains contextual memory across sessions, and handles complex scheduling logic autonomously.
 
 ## Architecture
-- **STT**: Deepgram (Nova-2) [Streaming WebSocket]
+- **STT**: Sarvam (Saaras v3) [Streaming WebSocket]
 - **LLM**: OpenAI (GPT-4o-mini) [Tool Orchestration]
-- **TTS**: Cartesia (Sonic) [Ultra-low latency streaming]
+- **TTS**: Sarvam (Bulbul v3) [Ultra-low latency streaming]
 - **Backend**: FastAPI (Python)
 - **Frontend**: Next.js (TypeScript) + Tailwind CSS
 - **Memory**: Redis (Session/Short-term) + Mock Patient DB (Long-term)
@@ -20,14 +20,13 @@ A real-time voice AI agent for clinical appointment booking. The agent operates 
 - **Optimization**: 
     - Full WebSocket pipeline (no HTTP overhead).
     - Streaming LLM tokens directly to TTS.
-    - Nova-2 model for fast speech detection.
+   - Saaras v3 model for fast speech detection.
 
 ## Setup Instructions
 1. **Environment Variables**: Create a `.env` file with:
    ```
-   DEEPGRAM_API_KEY=your_key
+   SARVAM_API_KEY=your_key
    OPENAI_API_KEY=your_key
-   CARTESIA_API_KEY=your_key
    REDIS_HOST=localhost
    REDIS_PORT=6379
    ```

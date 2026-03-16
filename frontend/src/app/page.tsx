@@ -50,7 +50,8 @@ const Waveform = ({ analyzer }: { analyzer: AnalyserNode | null }) => {
 
 export default function Home() {
   const [isRecording, setIsRecording] = useState(false);
-  const [agentResponse, setAgentResponse] = useState("");
+  const [userTranscript, setUserTranscript] = useState("");
+  const [assistantResponse, setAssistantResponse] = useState("");
   const [status, setStatus] = useState<"idle" | "listening" | "thinking" | "speaking">("idle");
   const [language, setLanguage] = useState<"en" | "hi" | "ta">("en");
   const [reasoningTrace, setReasoningTrace] = useState<string[]>([]);
@@ -66,6 +67,7 @@ export default function Home() {
   const workletNodeRef = useRef<AudioWorkletNode | null>(null);
   const sourcesRef = useRef<AudioBufferSourceNode[]>([]); // Track active audio nodes for interruption
   const audioQueue = useRef<Int16Array[]>([]);
+  const decodeChainRef = useRef<Promise<void>>(Promise.resolve());
   const isPlaying = useRef(false);
   const nextStartTime = useRef<number>(0);
   const [sessionId] = useState(() => `sess_${Math.random().toString(36).substring(7)}`);
@@ -79,7 +81,7 @@ export default function Home() {
   //   4. 80ms pre-roll buffer absorbs network jitter
   // ──────────────────────────────────────────────────────────
 
-  const TTS_SAMPLE_RATE = 16000; // Deepgram Aura always outputs 16kHz
+  const TTS_SAMPLE_RATE = 16000; // Legacy PCM fallback sample rate
 
   const getOrCreateAudioContext = (): AudioContext => {
     if (!audioContextRef.current || audioContextRef.current.state === 'closed') {
@@ -142,6 +144,41 @@ export default function Home() {
       // Remove from sources list
       sourcesRef.current = sourcesRef.current.filter(s => s !== source);
       // Only mark idle when queue is drained AND scheduled audio has finished
+      if (audioQueue.current.length === 0 && ctx.currentTime >= nextStartTime.current - 0.05) {
+        isPlaying.current = false;
+        setStatus("idle");
+      }
+    };
+  };
+
+  const scheduleDecodedBuffer = (buffer: AudioBuffer) => {
+    const ctx = getOrCreateAudioContext();
+
+    const source = ctx.createBufferSource();
+    source.buffer = buffer;
+    const gain = ctx.createGain();
+    source.connect(gain);
+    gain.connect(analyzerRef.current!);
+
+    const now = ctx.currentTime;
+    if (nextStartTime.current < now + 0.01) {
+      nextStartTime.current = now + 0.08;
+    }
+
+    const startAt = nextStartTime.current;
+    source.start(startAt);
+    const fadeInEnd = startAt + 0.008;
+    const fadeOutStart = Math.max(startAt + 0.008, startAt + buffer.duration - 0.012);
+    gain.gain.setValueAtTime(0.0, startAt);
+    gain.gain.linearRampToValueAtTime(1.0, fadeInEnd);
+    gain.gain.setValueAtTime(1.0, fadeOutStart);
+    gain.gain.linearRampToValueAtTime(0.0, startAt + buffer.duration);
+
+    nextStartTime.current += buffer.duration;
+    sourcesRef.current.push(source);
+
+    source.onended = () => {
+      sourcesRef.current = sourcesRef.current.filter(s => s !== source);
       if (audioQueue.current.length === 0 && ctx.currentTime >= nextStartTime.current - 0.05) {
         isPlaying.current = false;
         setStatus("idle");
@@ -213,10 +250,10 @@ export default function Home() {
             const data = JSON.parse(event.data);
             console.log('[WS] Text msg:', data.type);
             if (data.type === "llm_text") {
-              setAgentResponse(prev => prev + data.content);
+              setAssistantResponse(prev => prev + data.content);
               setStatus("thinking");
             } else if (data.type === "stt_text") {
-              setAgentResponse(`You: ${data.content}${data.is_final ? "" : "..."}`);
+              setUserTranscript(`${data.content}${data.is_final ? "" : "..."}`);
               if (data.is_final) setStatus("thinking");
             } else if (data.type === "reasoning") {
               setReasoningTrace(prev => [...prev.slice(-4), data.content]);
@@ -243,13 +280,8 @@ export default function Home() {
             }
           } catch (_) { /* not JSON */ }
         } else {
-          // Binary audio data — push to queue and drain
+          // Binary audio data (WAV/MP3 from backend) with PCM fallback.
           const arrayBuffer = await event.data.arrayBuffer();
-          const int16Array = new Int16Array(arrayBuffer);
-          console.log('[Audio] TTS chunk received:', int16Array.length, 'samples');
-          audioQueue.current.push(int16Array);
-
-          // Resume context (browser may suspend on tab switch or first play)
           const ctx = getOrCreateAudioContext();
           if (ctx.state === 'suspended') await ctx.resume();
 
@@ -257,7 +289,19 @@ export default function Home() {
             isPlaying.current = true;
             setStatus("speaking");
           }
-          drainQueue();
+
+          decodeChainRef.current = decodeChainRef.current.then(async () => {
+            try {
+              const decoded = await ctx.decodeAudioData(arrayBuffer.slice(0));
+              console.log('[Audio] Decoded chunk:', decoded.duration.toFixed(3), 's');
+              scheduleDecodedBuffer(decoded);
+            } catch {
+              const int16Array = new Int16Array(arrayBuffer);
+              console.log('[Audio] PCM fallback chunk:', int16Array.length, 'samples');
+              audioQueue.current.push(int16Array);
+              drainQueue();
+            }
+          });
         }
       };
 
@@ -276,7 +320,7 @@ export default function Home() {
         setStatus("idle");
         if (e.code === 1012 || e.code === 1006) {
           // Service restart or abnormal close — notify user
-          setAgentResponse("Connection lost (server restarted). Click the orb to reconnect.");
+          setAssistantResponse("Connection lost (server restarted). Click the orb to reconnect.");
         }
       };
 
@@ -284,7 +328,8 @@ export default function Home() {
         console.error('[WS] Error:', err);
       };
 
-      setAgentResponse("");
+      setUserTranscript("");
+      setAssistantResponse("");
     } catch (err) {
       console.error("Error accessing microphone:", err);
     }
@@ -429,13 +474,20 @@ export default function Home() {
           </div>
 
           {/* Transcript Box */}
-          <div className="mt-8 w-full glass-panel p-8 min-h-[140px] max-h-[200px] overflow-y-auto flex items-center justify-center" style={{ scrollbarWidth: 'thin', scrollbarColor: 'rgba(99,102,241,0.2) transparent' }}>
-            {agentResponse ? (
-              <p className="text-lg font-light text-slate-200 leading-relaxed text-center italic">
-                &ldquo;{agentResponse}&rdquo;
-              </p>
+          <div className="mt-8 w-full glass-panel p-8 min-h-[140px] max-h-[220px] overflow-y-auto" style={{ scrollbarWidth: 'thin', scrollbarColor: 'rgba(99,102,241,0.2) transparent' }}>
+            {userTranscript || assistantResponse ? (
+              <div className="space-y-4">
+                <div>
+                  <p className="text-[10px] uppercase tracking-widest text-cyan-400 font-bold mb-1">Input (You)</p>
+                  <p className="text-base font-light text-slate-200 leading-relaxed italic">{userTranscript || "..."}</p>
+                </div>
+                <div>
+                  <p className="text-[10px] uppercase tracking-widest text-indigo-400 font-bold mb-1">Output (Assistant)</p>
+                  <p className="text-lg font-light text-slate-100 leading-relaxed italic">{assistantResponse || "..."}</p>
+                </div>
+              </div>
             ) : (
-              <p className="text-slate-600 font-light italic text-sm">Waiting for audio input...</p>
+              <p className="text-slate-600 font-light italic text-sm text-center">Waiting for audio input...</p>
             )}
           </div>
         </div>
@@ -488,7 +540,11 @@ export default function Home() {
           <GlassCard title="Quick Controls">
             <div className="grid grid-cols-1 gap-3">
               <button
-                onClick={() => { setAgentResponse(""); setReasoningTrace([]); }}
+                onClick={() => {
+                  setUserTranscript("");
+                  setAssistantResponse("");
+                  setReasoningTrace([]);
+                }}
                 className="flex items-center justify-between p-3 rounded-xl clinical-card text-[10px] font-bold text-slate-400 hover:text-white group"
               >
                 <span>CLEAR HISTORY</span>
