@@ -1,0 +1,10 @@
+/* Existing styles... */
+
+.campaign-card {
+  transition: transform 0.2s ease;
+}
+
+.campaign-card:hover {
+  transform: scale(1.02);
+  border-color: var(--primary);
+}
